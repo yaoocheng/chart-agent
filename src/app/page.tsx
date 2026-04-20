@@ -1,7 +1,7 @@
 'use client';
 
 import { useChat, type Message } from 'ai/react';
-import { Input, Button, Card, Typography } from 'antd';
+import { Avatar, Button, Card, ConfigProvider, Input, Typography } from 'antd';
 import { PauseCircleOutlined, SendOutlined } from '@ant-design/icons';
 import dynamic from 'next/dynamic';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -9,6 +9,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import ShowCode from '@/components/ShowCode';
 import ToolTrace, { ToolTracePending } from '@/components/ToolTrace';
+import ProcessPanel, { type AgentProcessEvent } from '@/components/ProcessPanel';
 
 const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false });
 
@@ -142,6 +143,50 @@ export default function AgentPage() {
     return map[toolName] ?? toolName;
   };
 
+  const extractProcessEvents = (m: Message) => {
+    const annotations = (m.annotations ?? []) as unknown[];
+    const events: AgentProcessEvent[] = [];
+    for (const a of annotations) {
+      if (!a || typeof a !== 'object') continue;
+      const obj = a as Record<string, unknown>;
+      if (obj.kind !== 'agent-process') continue;
+      const type = obj.type;
+      if (type === 'thought' && typeof obj.text === 'string') {
+        events.push({ kind: 'agent-process', type: 'thought', text: obj.text, ts: obj.ts as number | undefined });
+      }
+      if (type === 'tool_start' && typeof obj.tool === 'string') {
+        events.push({
+          kind: 'agent-process',
+          type: 'tool_start',
+          tool: obj.tool,
+          label: typeof obj.label === 'string' ? obj.label : undefined,
+          ts: obj.ts as number | undefined,
+        });
+      }
+      if (type === 'tool_done' && typeof obj.tool === 'string') {
+        events.push({
+          kind: 'agent-process',
+          type: 'tool_done',
+          tool: obj.tool,
+          label: typeof obj.label === 'string' ? obj.label : undefined,
+          summary: typeof obj.summary === 'string' ? obj.summary : undefined,
+          ts: obj.ts as number | undefined,
+        });
+      }
+      if (type === 'tool_error' && typeof obj.tool === 'string') {
+        events.push({
+          kind: 'agent-process',
+          type: 'tool_error',
+          tool: obj.tool,
+          label: typeof obj.label === 'string' ? obj.label : undefined,
+          error: typeof obj.error === 'string' ? obj.error : undefined,
+          ts: obj.ts as number | undefined,
+        });
+      }
+    }
+    return events;
+  };
+
   const thinkingLabel = useMemo(() => {
     const hasAnyToolCall = Object.keys(doneToolNames).length > 0;
     return hasAnyToolCall ? '已完成思考' : '思考中';
@@ -154,6 +199,7 @@ export default function AgentPage() {
         invocations: ToolInvocation[];
         combinedText: string;
         chartInvocations: ToolInvocation[];
+        processEvents: AgentProcessEvent[];
       }
     >();
     const suppressedAssistantIds = new Set<string>();
@@ -169,6 +215,7 @@ export default function AgentPage() {
       const invocations: ToolInvocation[] = [];
       const chartInvocations: ToolInvocation[] = [];
       const texts: string[] = [];
+      const processEvents: AgentProcessEvent[] = [];
 
       let j = i + 1;
       while (j < len && messages[j].role !== 'user') {
@@ -181,6 +228,7 @@ export default function AgentPage() {
 
           const content = typeof m.content === 'string' ? m.content.trim() : '';
           if (content) texts.push(content);
+          processEvents.push(...extractProcessEvents(m));
 
           for (const inv of m.toolInvocations ?? []) {
             const typed = inv as ToolInvocation;
@@ -197,6 +245,7 @@ export default function AgentPage() {
           invocations,
           combinedText: texts.join('\n\n'),
           chartInvocations,
+          processEvents,
         });
       }
 
@@ -246,13 +295,38 @@ export default function AgentPage() {
   };
 
   return (
-    <div className="flex flex-col h-screen max-w-4xl mx-auto p-4 bg-white text-gray-800">
-      <div className="text-center py-6 border-b mb-4">
-        <h1 className="text-3xl font-bold text-gray-800">AI Chart Agent</h1>
-        <p className="text-gray-500 mt-2">一句话生成 ECharts，并可在对话里直接预览。</p>
-      </div>
+    <ConfigProvider
+      theme={{
+        token: {
+          colorPrimary: '#1677ff',
+          borderRadius: 16,
+          colorBgLayout: '#f5f7fa',
+          colorBgContainer: '#ffffff',
+          colorBorderSecondary: '#f0f0f0',
+          boxShadowSecondary: '0 8px 24px rgba(31, 35, 41, 0.06)',
+        },
+      }}
+    >
+      <div className="min-h-screen bg-[#f5f7fa] p-4 text-gray-800 md:p-6">
+        <div className="mx-auto flex h-[calc(100vh-32px)] max-w-5xl flex-col gap-4 md:h-[calc(100vh-48px)]">
+          <div className="rounded-2xl border border-gray-200 bg-white px-6 py-5 shadow-sm">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h1 className="text-3xl font-semibold tracking-tight text-slate-800">AI Chart Studio</h1>
+                <p className="mt-2 text-sm text-slate-500">从一句需求到图表配置、分析结论与持续修改，都可以在这里完成。</p>
+              </div>
+              <div className="hidden rounded-xl bg-slate-50 px-4 py-3 text-xs leading-6 text-slate-500 md:block">
+                <div>支持生成、改图、校验、分析与本地会话记忆</div>
+                <div>更适合做报表草稿、数据说明和图表调优</div>
+              </div>
+            </div>
+          </div>
 
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto mb-4 px-2 space-y-4">
+          <div
+            ref={scrollContainerRef}
+            className="flex-1 overflow-y-auto rounded-2xl border border-gray-200 bg-white px-5 py-5 shadow-sm md:px-6"
+          >
+            <div className="space-y-5">
         {messages.map((msg: Message) => {
           const hasText = typeof msg.content === 'string' && msg.content.trim().length > 0;
           const combined = combinedTurnByAnchorId.map.get(msg.id);
@@ -263,9 +337,18 @@ export default function AgentPage() {
 
           return (
             <div key={msg.id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-              <Text type="secondary" className="block mb-1">
-                {msg.role === 'user' ? '你' : 'Agent'}
-              </Text>
+              <div className="mb-2 flex items-center gap-2">
+                <Avatar
+                  size={28}
+                  className={msg.role === 'user' ? 'bg-blue-500' : 'bg-slate-800'}
+                  style={{ fontSize: 12 }}
+                >
+                  {msg.role === 'user' ? '你' : 'AI'}
+                </Avatar>
+                <Text type="secondary">{msg.role === 'user' ? '你' : '图表助手'}</Text>
+              </div>
+
+              {msg.role === 'assistant' && combined ? <ProcessPanel events={combined.processEvents} /> : null}
 
               {msg.role === 'assistant' && combined ? (
                 <ToolTrace message={{ ...msg, toolInvocations: combined.invocations } as Message} />
@@ -330,43 +413,50 @@ export default function AgentPage() {
           );
         })}
 
-        {showAgentPending ? (
-          <div className="flex flex-col items-start">
-            <Text type="secondary" className="block mb-1">
-              Agent
-            </Text>
-            <details className="mb-2 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700">
-              <summary className="cursor-pointer select-none">{thinkingLabel}</summary>
-              <div className="mt-2 text-gray-600">
-                计划：{pendingTools.map(toolLabel).join(' → ')}
+            {showAgentPending ? (
+              <div className="flex flex-col items-start">
+                <div className="mb-2 flex items-center gap-2">
+                  <Avatar size={28} className="bg-slate-800" style={{ fontSize: 12 }}>
+                    AI
+                  </Avatar>
+                  <Text type="secondary">图表助手</Text>
+                </div>
+                <details className="mb-2 w-full max-w-[80%] rounded-xl border border-gray-200 bg-slate-50 px-4 py-3 text-xs text-gray-700">
+                  <summary className="cursor-pointer select-none font-medium">{thinkingLabel}</summary>
+                  <div className="mt-2 text-gray-600">计划：{pendingTools.map(toolLabel).join(' → ')}</div>
+                </details>
+                <ToolTracePending toolNames={pendingTools} doneToolNames={doneToolNames} />
               </div>
-            </details>
-            <ToolTracePending toolNames={pendingTools} doneToolNames={doneToolNames} />
+            ) : null}
+
+            <div ref={bottomRef} />
+            </div>
           </div>
-        ) : null}
 
-        <div ref={bottomRef} />
+          <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+            <form onSubmit={onSubmit} className="flex items-center gap-3">
+              <Input
+                size="large"
+                value={input}
+                onChange={handleInputChange}
+                placeholder="例如：帮我画一个折线图，展示过去5天的气温变化..."
+                disabled={isLoading}
+                variant="borderless"
+                className="flex-1"
+              />
+              <Button
+                size="large"
+                type="primary"
+                htmlType="submit"
+                icon={isLoading ? <PauseCircleOutlined /> : <SendOutlined />}
+                loading={false}
+                aria-label={isLoading ? '生成中' : '发送'}
+                className="min-w-12 shadow-none"
+              />
+            </form>
+          </div>
+        </div>
       </div>
-
-      <form onSubmit={onSubmit} className="flex gap-3 pt-4 border-t">
-        <Input
-          size="large"
-          value={input}
-          onChange={handleInputChange}
-          placeholder="例如：帮我画一个折线图，展示过去5天的气温变化..."
-          disabled={isLoading}
-          className="flex-1"
-        />
-        <Button
-          size="large"
-          type="primary"
-          htmlType="submit"
-          icon={isLoading ? <PauseCircleOutlined /> : <SendOutlined />}
-          loading={false}
-          aria-label={isLoading ? '生成中' : '发送'}
-          className="min-w-12"
-        />
-      </form>
-    </div>
+    </ConfigProvider>
   );
 }

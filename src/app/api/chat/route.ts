@@ -1,4 +1,4 @@
-import { streamText, tool } from 'ai';
+import { StreamData, streamText, tool } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
 
@@ -23,6 +23,21 @@ const qwen = createOpenAI({
 
 export async function POST(req: Request) {
   const { messages, currentOptionCode } = await req.json();
+  const data = new StreamData();
+
+  const emit = (event: Record<string, unknown>) => {
+    data.appendMessageAnnotation({
+      kind: 'agent-process',
+      ts: Date.now(),
+      ...event,
+    });
+  };
+
+  const latestUserText =
+    [...messages]
+      .reverse()
+      .find((m: { role?: string; content?: string }) => m?.role === 'user' && typeof m.content === 'string')
+      ?.content ?? '';
 
   const safeJsonParse = (raw: string) => {
     try {
@@ -77,9 +92,32 @@ export async function POST(req: Request) {
       .trim();
   };
 
+  const inferThought = (text: string) => {
+    const t = String(text || '');
+    if (/https?:\/\/\S+/i.test(t)) {
+      return '识别到你提供了接口/URL，我会先请求数据，再推荐图表并生成结果。';
+    }
+    if (t.includes('\n') && t.split('\n').some((line) => line.includes(','))) {
+      return '识别到你提供了表格/CSV 数据，我会先解析数据结构，再推荐图表类型并生成图表。';
+    }
+    if (currentOptionCode && /(改|修改|换|变成|替换|调整|加上|增加|删除|去掉|改成|优化)/.test(t)) {
+      return '识别到当前已有图表配置，我会基于当前 option 进行最小改动并校验结果。';
+    }
+    return '我会先理解你的需求，再选择合适的工具来完成这次图表任务。';
+  };
+
+  const emitToolStart = (tool: string, label: string) => emit({ type: 'tool_start', tool, label });
+  const emitToolDone = (tool: string, label: string, summary?: string) => emit({ type: 'tool_done', tool, label, summary });
+  const emitToolError = (tool: string, label: string, error: string) => emit({ type: 'tool_error', tool, label, error });
+
+  emit({ type: 'thought', text: inferThought(latestUserText) });
+
   const result = await streamText({
     model: qwen('openai/gpt-oss-120b:free'),
     messages,
+    onFinish: async () => {
+      await data.close();
+    },
     system:
       [
         '你是一个专业的数据可视化与前端图表 Agent（ECharts）。你需要理解用户需求，并通过工具输出可渲染的图表配置。',
@@ -91,7 +129,8 @@ export async function POST(req: Request) {
         '- 只有当用户明确表达“新生成一张 / 再来一张 / 保留当前图再画一张 / 做对比”时，才调用 `render_chart` 生成新的图。',
         '- 如果用户提供 CSV/表格数据：优先调用 `read_csv_data` 解析，再根据解析结果调用 `recommend_chart_type` 和 `render_chart`。',
         '- 如果用户提到“从接口/URL取数据”：先调用 `fetch_api_data` 获取 JSON，再基于数据生成图。',
-        '- 在产出 option 前后可以调用 `validate_option`，如有错误再调用 `repair_option`。',
+        '- 重要：只要用户“希望看到图表/生成图表”，本轮最终必须调用一次 `render_chart` 或 `update_chart` 产出 `optionCode`，不能只用文字描述“已生成”。',
+        '- `validate_option`/`repair_option` 只能在已经有 `optionCode` 的情况下使用：生成(option) -> 校验 -> 必要时修复 -> 再返回最终图表。',
         '- 若信息不足以生成/修改（缺少维度、指标、时间范围等），先用自然语言提出最多 3 个澄清问题，不要调用工具。',
         '',
         '# 输出约束（重要）',
@@ -123,9 +162,12 @@ export async function POST(req: Request) {
           headersJson?: string;
           bodyJson?: string;
         }) => {
+          emitToolStart('fetch_api_data', '请求数据');
           const safeUrl = String(url);
           if (!/^https:\/\//.test(safeUrl) && !/^http:\/\/localhost(?::\d+)?\//.test(safeUrl)) {
-            return { success: false, error: 'URL 仅允许 https 或 localhost（开发期限制）' };
+            const error = 'URL 仅允许 https 或 localhost（开发期限制）';
+            emitToolError('fetch_api_data', '请求数据', error);
+            return { success: false, error };
           }
           const headers: Record<string, string> = {};
           if (headersJson) {
@@ -137,15 +179,25 @@ export async function POST(req: Request) {
           let body: string | undefined;
           if (method === 'POST' && bodyJson) {
             const parsed = safeJsonParse(bodyJson);
-            if (!parsed.ok) return { success: false, error: `bodyJson 不是合法 JSON：${parsed.error}` };
+            if (!parsed.ok) {
+              const error = `bodyJson 不是合法 JSON：${parsed.error}`;
+              emitToolError('fetch_api_data', '请求数据', error);
+              return { success: false, error };
+            }
             body = JSON.stringify(parsed.value);
             headers['content-type'] = headers['content-type'] || 'application/json';
           }
           const res = await fetch(safeUrl, { method, headers, body, cache: 'no-store' });
           const text = await res.text();
-          if (!res.ok) return { success: false, status: res.status, error: text.slice(0, 2000) };
+          if (!res.ok) {
+            const error = text.slice(0, 2000);
+            emitToolError('fetch_api_data', '请求数据', `${res.status}: ${error}`);
+            return { success: false, status: res.status, error };
+          }
           const parsed = safeJsonParse(text);
-          return parsed.ok ? { success: true, data: parsed.value } : { success: true, dataText: text };
+          const payload = parsed.ok ? { success: true, data: parsed.value } : { success: true, dataText: text };
+          emitToolDone('fetch_api_data', '请求数据', parsed.ok ? '已获取 JSON 数据' : '已获取文本数据');
+          return payload;
         },
       }),
 
@@ -155,8 +207,13 @@ export async function POST(req: Request) {
           csvText: z.string().describe('CSV 原始文本（第一行必须是表头）'),
         }),
         execute: async ({ csvText }: { csvText: string }) => {
+          emitToolStart('read_csv_data', '解析 CSV');
           const parsed = safeParseCsv(csvText);
-          if (!parsed.ok) return { success: false, error: parsed.error };
+          if (!parsed.ok) {
+            emitToolError('read_csv_data', '解析 CSV', parsed.error);
+            return { success: false, error: parsed.error };
+          }
+          emitToolDone('read_csv_data', '解析 CSV', `解析出 ${parsed.header.length} 列、${parsed.rows.length} 行`);
           return { success: true, columns: parsed.header, rows: parsed.rows };
         },
       }),
@@ -177,6 +234,7 @@ export async function POST(req: Request) {
           columns?: string[];
           sampleRowsJson?: string;
         }) => {
+          emitToolStart('recommend_chart_type', '推荐图表');
           // This tool is intentionally deterministic: it returns a compact recommendation scaffold.
           // The LLM can call it to obtain a stable "plan" object to follow.
           let sampleRows: unknown = undefined;
@@ -184,7 +242,7 @@ export async function POST(req: Request) {
             const parsed = safeJsonParse(sampleRowsJson);
             if (parsed.ok) sampleRows = parsed.value;
           }
-          return {
+          const result = {
             success: true,
             recommendation: {
               chartTypeCandidates: ['line', 'bar', 'pie', 'scatter'],
@@ -194,6 +252,8 @@ export async function POST(req: Request) {
               sampleRows: sampleRows ?? null,
             },
           };
+          emitToolDone('recommend_chart_type', '推荐图表', '已给出图表类型建议');
+          return result;
         },
       }),
 
@@ -203,12 +263,16 @@ export async function POST(req: Request) {
           optionCode: z.string().describe('ECharts option（JS 对象代码字符串）'),
         }),
         execute: async ({ optionCode }: { optionCode: string }) => {
+          emitToolStart('analyze_chart', '分析图表');
           // Keep analysis shallow and safe on server; the model will produce the narrative.
           const parsed = safeEvalOption(optionCode);
-          if (!parsed.ok) return { success: false, error: parsed.error };
+          if (!parsed.ok) {
+            emitToolError('analyze_chart', '分析图表', parsed.error);
+            return { success: false, error: parsed.error };
+          }
           const option = parsed.option as ChartOption;
           const series = Array.isArray(option?.series) ? option.series : option?.series ? [option.series] : [];
-          return {
+          const result = {
             success: true,
             summary: {
               title: option?.title?.text ?? null,
@@ -218,6 +282,8 @@ export async function POST(req: Request) {
               hasTooltip: !!option?.tooltip,
             },
           };
+          emitToolDone('analyze_chart', '分析图表', `检测到 ${series.length} 个系列`);
+          return result;
         },
       }),
 
@@ -227,13 +293,18 @@ export async function POST(req: Request) {
           optionCode: z.string().describe('ECharts option（JS 对象代码字符串）'),
         }),
         execute: async ({ optionCode }: { optionCode: string }) => {
+          emitToolStart('validate_option', '校验配置');
           const parsed = safeEvalOption(optionCode);
-          if (!parsed.ok) return { success: false, ok: false, errors: [parsed.error] };
+          if (!parsed.ok) {
+            emitToolError('validate_option', '校验配置', parsed.error);
+            return { success: false, ok: false, errors: [parsed.error] };
+          }
           const option = parsed.option as ChartOption;
           const errors: string[] = [];
           if (!option || typeof option !== 'object') errors.push('option 不是对象');
           const hasSeries = !!option?.series;
           if (!hasSeries) errors.push('option.series 缺失');
+          emitToolDone('validate_option', '校验配置', errors.length === 0 ? '校验通过' : `发现 ${errors.length} 个问题`);
           return { success: true, ok: errors.length === 0, errors };
         },
       }),
@@ -245,10 +316,15 @@ export async function POST(req: Request) {
           errors: z.array(z.string()).optional().describe('validate_option 返回的 errors'),
         }),
         execute: async ({ optionCode, errors }: { optionCode: string; errors?: string[] }) => {
+          emitToolStart('repair_option', '修复配置');
           // Conservative: if evaluation fails, return minimal empty option.
           const parsed = safeEvalOption(optionCode);
-          if (parsed.ok) return { success: true, optionCode };
+          if (parsed.ok) {
+            emitToolDone('repair_option', '修复配置', '原配置无需修复');
+            return { success: true, optionCode };
+          }
           const safeFallback = '{ series: [] }';
+          emitToolDone('repair_option', '修复配置', '已回退为安全配置');
           return { success: true, optionCode: safeFallback, note: `已回退为安全配置；原错误：${parsed.error}; hints=${(errors || []).join(';')}` };
         },
       }),
@@ -275,7 +351,10 @@ export async function POST(req: Request) {
           optionCode: string;
           explanation: string;
         }) => {
-          return { success: true, chartType, optionCode, explanation: stripCodeFromExplanation(explanation) };
+          emitToolStart('render_chart', '生成图表');
+          const result = { success: true, chartType, optionCode, explanation: stripCodeFromExplanation(explanation) };
+          emitToolDone('render_chart', '生成图表', `已生成 ${chartType} 图表`);
+          return result;
         },
       }),
       update_chart: tool({
@@ -304,7 +383,10 @@ export async function POST(req: Request) {
           optionCode: string;
           explanation: string;
         }) => {
-          return { success: true, chartType, optionCode, explanation: stripCodeFromExplanation(explanation) };
+          emitToolStart('update_chart', '修改图表');
+          const result = { success: true, chartType, optionCode, explanation: stripCodeFromExplanation(explanation) };
+          emitToolDone('update_chart', '修改图表', `已更新为 ${chartType} 图表`);
+          return result;
         },
       }),
       summarize_chart_state: tool({
@@ -313,11 +395,13 @@ export async function POST(req: Request) {
           optionCode: z.string().describe('当前 ECharts option（JS 对象代码字符串）'),
         }),
         execute: async ({ optionCode }: { optionCode: string }) => {
+          emitToolStart('summarize_chart_state', '总结状态');
+          emitToolDone('summarize_chart_state', '总结状态', '已提取当前图配置');
           return { success: true, optionCode };
         },
       }),
     },
     maxSteps: 5,
   });
-  return result.toDataStreamResponse();
+  return result.toDataStreamResponse({ data });
 }

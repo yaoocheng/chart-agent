@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "chart agent",
-  description: "",
+  title: "AI Chart Studio",
+  description: "一个支持图表生成、修改、校验与分析的智能可视化助手。",
 };
 
 export default function RootLayout({
